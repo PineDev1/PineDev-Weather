@@ -7,6 +7,7 @@ import Combine
 import CoreLocation
 import MapKit
 import SwiftUI
+import UIKit
 
 struct RadarScreen: View {
     @Environment(WeatherStore.self) private var store
@@ -18,7 +19,7 @@ struct RadarScreen: View {
     @State private var lightningOn = true
     @State private var lightning: LightningClient.Overlay?
 
-    private let timer = Timer.publish(every: 0.6, on: .main, in: .common).autoconnect()
+    private let timer = Timer.publish(every: 2.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -27,7 +28,8 @@ struct RadarScreen: View {
                 placeName: store.snapshot?.place.name ?? "Location",
                 template: currentTemplate,
                 lightningEnabled: lightningOn,
-                lightningTemplates: lightning?.templates ?? []
+                lightningTemplates: lightning?.templates ?? [],
+                onUserNavigated: { isPlaying = false }
             )
             .ignoresSafeArea()
 
@@ -228,19 +230,114 @@ final class WeatherTileOverlay: MKTileOverlay {
     }
 
     let kind: Kind
+    /// RainViewer and RealEarth only publish tiles through zoom 7. MapKit still
+    /// asks for higher zooms so we upscale the parent tile instead of going blank.
+    let nativeMaxZ = 7
+
+    private let templateLock = NSLock()
+    private var currentTemplate: String
 
     init(urlTemplate: String, kind: Kind) {
         self.kind = kind
+        self.currentTemplate = urlTemplate
         super.init(urlTemplate: urlTemplate)
         canReplaceMapContent = false
         minimumZ = 1
-        maximumZ = 7
+        maximumZ = 12
         switch kind {
         case .radar:
             tileSize = CGSize(width: 512, height: 512)
         case .lightning:
             tileSize = CGSize(width: 256, height: 256)
         }
+    }
+
+    func updateTemplate(_ template: String) {
+        templateLock.lock()
+        currentTemplate = template
+        templateLock.unlock()
+    }
+
+    override func loadTile(at path: MKTileOverlayPath, result: @escaping (Data?, Error?) -> Void) {
+        let shift = max(0, path.z - nativeMaxZ)
+        let nativeZ = path.z - shift
+        let parentX = path.x >> shift
+        let parentY = path.y >> shift
+
+        templateLock.lock()
+        let template = currentTemplate
+        templateLock.unlock()
+
+        guard let url = Self.url(template: template, z: nativeZ, x: parentX, y: parentY) else {
+            result(nil, nil)
+            return
+        }
+
+        let request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 20)
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                result(nil, error)
+                return
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                result(nil, nil)
+                return
+            }
+            guard let data else {
+                result(nil, nil)
+                return
+            }
+            if shift == 0 {
+                result(data, nil)
+                return
+            }
+            result(Self.overzoomedTile(from: data, path: path, shift: shift, outputSize: self.tileSize), nil)
+        }.resume()
+    }
+
+    private static func url(template: String, z: Int, x: Int, y: Int) -> URL? {
+        let filled = template
+            .replacingOccurrences(of: "{z}", with: String(z))
+            .replacingOccurrences(of: "{x}", with: String(x))
+            .replacingOccurrences(of: "{y}", with: String(y))
+        return URL(string: filled)
+    }
+
+    private static func overzoomedTile(
+        from data: Data,
+        path: MKTileOverlayPath,
+        shift: Int,
+        outputSize: CGSize
+    ) -> Data? {
+        guard let image = UIImage(data: data)?.cgImage else { return data }
+        let scale = 1 << shift
+        let cropW = image.width / scale
+        let cropH = image.height / scale
+        guard cropW > 0, cropH > 0 else { return data }
+
+        let subX = path.x % scale
+        let subY = path.y % scale
+        let cropRect = CGRect(x: subX * cropW, y: subY * cropH, width: cropW, height: cropH)
+        guard let cropped = image.cropping(to: cropRect) else { return data }
+
+        let width = Int(outputSize.width)
+        let height = Int(outputSize.height)
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return data }
+
+        context.interpolationQuality = .none
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+        context.draw(cropped, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let scaled = context.makeImage() else { return data }
+        return UIImage(cgImage: scaled).pngData()
     }
 }
 
@@ -250,9 +347,10 @@ struct RadarMapView: UIViewRepresentable {
     var template: String?
     var lightningEnabled: Bool
     var lightningTemplates: [String]
+    var onUserNavigated: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(onUserNavigated: onUserNavigated)
     }
 
     func makeUIView(context: Context) -> MKMapView {
@@ -266,14 +364,12 @@ struct RadarMapView: UIViewRepresentable {
             MKCoordinateRegion(center: coordinate, span: MKCoordinateSpan(latitudeDelta: 2.8, longitudeDelta: 2.8)),
             animated: false
         )
+        context.coordinator.centeredCoordinate = coordinate
         return map
     }
 
     func updateUIView(_ map: MKMapView, context: Context) {
-        if abs(map.centerCoordinate.latitude - coordinate.latitude) > 0.35
-            || abs(map.centerCoordinate.longitude - coordinate.longitude) > 0.35 {
-            map.setCenter(coordinate, animated: true)
-        }
+        context.coordinator.onUserNavigated = onUserNavigated
 
         if context.coordinator.annotatedName != placeName {
             map.removeAnnotations(map.annotations.filter { $0 !== map.userLocation })
@@ -284,15 +380,34 @@ struct RadarMapView: UIViewRepresentable {
             context.coordinator.annotatedName = placeName
         }
 
+        let placeMoved =
+            abs(context.coordinator.centeredCoordinate.latitude - coordinate.latitude) > 0.2
+            || abs(context.coordinator.centeredCoordinate.longitude - coordinate.longitude) > 0.2
+        if placeMoved && !context.coordinator.userHasMovedMap {
+            map.setRegion(
+                MKCoordinateRegion(center: coordinate, span: MKCoordinateSpan(latitudeDelta: 2.8, longitudeDelta: 2.8)),
+                animated: true
+            )
+            context.coordinator.centeredCoordinate = coordinate
+        }
+
         if context.coordinator.template != template {
             context.coordinator.template = template
-            map.removeOverlays(context.coordinator.overlays(on: map, kind: .radar))
-            if let template {
-                let radar = WeatherTileOverlay(urlTemplate: template, kind: .radar)
-                if let lightningOverlay = context.coordinator.overlays(on: map, kind: .lightning).first {
-                    map.insertOverlay(radar, below: lightningOverlay)
-                } else {
-                    map.addOverlay(radar, level: .aboveLabels)
+            if let overlay = context.coordinator.radarOverlay, let template {
+                overlay.updateTemplate(template)
+                context.coordinator.radarRenderer?.reloadData()
+            } else {
+                map.removeOverlays(context.coordinator.overlays(on: map, kind: .radar))
+                context.coordinator.radarOverlay = nil
+                context.coordinator.radarRenderer = nil
+                if let template {
+                    let radar = WeatherTileOverlay(urlTemplate: template, kind: .radar)
+                    context.coordinator.radarOverlay = radar
+                    if let lightningOverlay = context.coordinator.overlays(on: map, kind: .lightning).first {
+                        map.insertOverlay(radar, below: lightningOverlay)
+                    } else {
+                        map.addOverlay(radar, level: .aboveLabels)
+                    }
                 }
             }
         }
@@ -316,6 +431,15 @@ struct RadarMapView: UIViewRepresentable {
         var template: String?
         var lightningKey: String?
         var annotatedName: String?
+        var centeredCoordinate = CLLocationCoordinate2D()
+        var userHasMovedMap = false
+        var radarOverlay: WeatherTileOverlay?
+        weak var radarRenderer: MKTileOverlayRenderer?
+        var onUserNavigated: () -> Void
+
+        init(onUserNavigated: @escaping () -> Void) {
+            self.onUserNavigated = onUserNavigated
+        }
 
         func overlays(on map: MKMapView, kind: WeatherTileOverlay.Kind) -> [MKOverlay] {
             map.overlays.filter { ($0 as? WeatherTileOverlay)?.kind == kind }
@@ -329,9 +453,25 @@ struct RadarMapView: UIViewRepresentable {
             if let weather = tile as? WeatherTileOverlay, weather.kind == .lightning {
                 renderer.alpha = 0.95
             } else {
-                renderer.alpha = 0.8
+                renderer.alpha = 0.85
+                radarRenderer = renderer
             }
             return renderer
+        }
+
+        func mapView(_ mapView: MKMapView, regionWillChangeAnimated animated: Bool) {
+            guard isUserDriven(mapView) else { return }
+            userHasMovedMap = true
+            onUserNavigated()
+        }
+
+        private func isUserDriven(_ mapView: MKMapView) -> Bool {
+            let recognizers = (mapView.gestureRecognizers ?? [])
+                + mapView.subviews.flatMap { $0.gestureRecognizers ?? [] }
+            return recognizers.contains { recognizer in
+                (recognizer is UIPanGestureRecognizer || recognizer is UIPinchGestureRecognizer)
+                    && (recognizer.state == .began || recognizer.state == .changed)
+            }
         }
     }
 }
