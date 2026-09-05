@@ -8,17 +8,35 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(WeatherStore.self) private var store
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        TabView {
+            ForecastScreen()
+                .tabItem {
+                    Label(store.palette.tabTitle, systemImage: store.theme == .classic ? "tree.fill" : "cloud.sun.fill")
+                }
+            RadarScreen()
+                .tabItem {
+                    Label("Radar", systemImage: "cloud.rain.fill")
+                }
+            AviationScreen()
+                .tabItem {
+                    Label("Aviation", systemImage: "airplane")
+                }
+            SettingsScreen()
+                .tabItem {
+                    Label("Settings", systemImage: "gearshape.fill")
+                }
         }
-        .padding()
+        .tint(store.palette.accent)
+        .environment(\.palette, store.palette)
+        .preferredColorScheme(store.theme.preferredColorScheme)
     }
 }
 
 #Preview {
     ContentView()
+        .environment(WeatherStore())
+        .environment(AviationStore())
 }

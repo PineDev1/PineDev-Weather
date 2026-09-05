@@ -9,9 +9,16 @@ import SwiftUI
 
 @main
 struct WeatherApp: App {
+    @State private var store = WeatherStore()
+    @State private var aviation = AviationStore()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environment(store)
+                .environment(aviation)
+                .environment(\.palette, store.palette)
+                .preferredColorScheme(store.theme.preferredColorScheme)
         }
     }
 }
